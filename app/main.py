@@ -1,85 +1,70 @@
-# app/main.py
 import os
-from typing import List
-
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
 
-from app.mom_pipeline import (
-    transcribe_audio_with_groq,
-    generate_mom_with_groq,
-)
+from dotenv import load_dotenv
+load_dotenv()
+
+from app.pipeline.asr import transcribe_with_groq
+from app.pipeline.cleaner import clean_transcript
+from app.pipeline.mom import generate_mom
+from app.pipeline.diarization import diarize_audio_api  # optional
 
 
 app = FastAPI(
-    title="Meeting MoM Bot (Groq)",
-    description="Upload a meeting recording and get Minutes of Meeting (MoM) using Groq Whisper + Llama.",
-    version="0.1.0",
-)
-
-# Allow all origins for dev – you can restrict later
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    title="Meeting MoM Bot (Whisper Only)",
+    description="Generate MoM using Groq Whisper + Llama 70B (No Enhancement)",
+    version="1.0"
 )
 
 
-class MomResponse(BaseModel):
-    meeting_title: str
-    meeting_date: str
-    attendees: List[str]
-    transcript: str
-    mom: str
-
-
-@app.post("/generate-mom", response_model=MomResponse)
-async def generate_mom(
+@app.post("/generate-mom")
+async def generate_mom_api(
     file: UploadFile = File(...),
     meeting_title: str = Form(...),
     meeting_date: str = Form(...),
-    attendees: str = Form(...),  # comma-separated
+    attendees: str = Form(...)
 ):
-    # Basic validation
+
     if not file.filename:
-        raise HTTPException(status_code=400, detail="No file uploaded.")
+        raise HTTPException(400, "Missing audio file")
 
-    # Save uploaded file to tmp folder
-    try:
-        contents = await file.read()
-        os.makedirs("tmp", exist_ok=True)
-        temp_path = os.path.join("tmp", file.filename)
-        with open(temp_path, "wb") as f:
-            f.write(contents)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to save file: {e}")
+    raw_path = f"tmp/{file.filename}"
+    os.makedirs("tmp", exist_ok=True)
+    contents = await file.read()
 
-    # 1) Transcribe with Groq Whisper
-    try:
-        transcript_text = transcribe_audio_with_groq(temp_path)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"ASR (Groq Whisper) failed: {e}")
+    with open(raw_path, "wb") as f:
+        f.write(contents)
 
-    # 2) Generate MoM with Groq LLM
+    # 1) Speaker Diarization (Optional — if fails, ignore)
+    diarized_text = ""
     try:
-        mom_text = generate_mom_with_groq(
-            transcript=transcript_text,
-            meeting_title=meeting_title,
-            meeting_date=meeting_date,
-            attendees=attendees,
+        audio_bytes = open(raw_path, "rb").read()
+        diarized_segments = diarize_audio_api(audio_bytes)
+
+        diarized_text = "\n".join(
+            [f"Speaker {seg['speaker']}: {seg['text']}" for seg in diarized_segments]
         )
+    except:
+        diarized_text = ""
+
+    # 2) ASR (Whisper via Groq)
+    try:
+        raw_text = transcribe_with_groq(open(raw_path, "rb").read())
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"LLM (Groq) failed: {e}")
+        raise HTTPException(500, f"ASR failed: {e}")
 
-    attendee_list = [a.strip() for a in attendees.split(",") if a.strip()]
+    # Combine diarization + transcription
+    combined = (diarized_text + "\n" + raw_text).strip()
 
-    return MomResponse(
-        meeting_title=meeting_title,
-        meeting_date=meeting_date,
-        attendees=attendee_list,
-        transcript=transcript_text,
-        mom=mom_text,
-    )
+    # 3) Clean transcript
+    cleaned = clean_transcript(combined)
+
+    # 4) Generate MoM
+    mom = generate_mom(cleaned, meeting_title, meeting_date, attendees)
+
+    return {
+        "diarized_transcript": diarized_text,
+        "raw_transcript": raw_text,
+        "clean_transcript": cleaned,
+        "mom": mom
+    }
